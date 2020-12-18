@@ -6,10 +6,11 @@ import be.ugent.rml.metadata.Metadata;
 import be.ugent.rml.metadata.MetadataGenerator;
 import be.ugent.rml.records.Record;
 import be.ugent.rml.records.RecordsFactory;
-import be.ugent.rml.store.SimpleQuadStore;
-import be.ugent.rml.term.ProvenancedQuad;
+import be.ugent.rml.store.Quad;
 import be.ugent.rml.store.QuadStore;
+import be.ugent.rml.store.SimpleQuadStore;
 import be.ugent.rml.term.NamedNode;
+import be.ugent.rml.term.ProvenancedQuad;
 import be.ugent.rml.term.ProvenancedTerm;
 import be.ugent.rml.term.Term;
 import org.slf4j.Logger;
@@ -17,18 +18,23 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.sql.SQLException;
-import java.util.*;
-import java.util.function.BiConsumer;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.BiFunction;
+import java.util.stream.Stream;
 
 public class Executor {
 
     private static final Logger logger = LoggerFactory.getLogger(Executor.class);
 
     private Initializer initializer;
-    private HashMap<Term, List<Record>> recordsHolders;
+    private Map<Term, List<Record>> recordsHolders;
     // this map stores for every Triples Map, which is a Term, a map with the record index and the record's corresponding subject,
     // which is a ProvenancedTerm.
-    private HashMap<Term, HashMap<Integer, ProvenancedTerm>> subjectCache;
+    private Map<Term, HashMap<Integer, ProvenancedTerm>> subjectCache;
 
     //NB: mapped quads store
     private QuadStore resultingQuads;
@@ -37,7 +43,7 @@ public class Executor {
     private QuadStore rmlStore;
     private RecordsFactory recordsFactory;
     private static int blankNodeCounter = 0;
-    private HashMap<Term, Mapping> mappings;
+    private Map<Term, Mapping> mappings;
     private String baseIRI;
 
     public Executor(QuadStore rmlStore, RecordsFactory recordsFactory, String baseIRI) throws Exception {
@@ -65,22 +71,88 @@ public class Executor {
     }
 
     public QuadStore execute(List<Term> triplesMaps, boolean removeDuplicates, MetadataGenerator metadataGenerator) throws Exception {
-
-        BiConsumer<ProvenancedTerm, PredicateObjectGraph> pogFunction;
+        BiFunction<ProvenancedTerm, PredicateObjectGraph, Quad> pogFunction;
 
         if (metadataGenerator != null && metadataGenerator.getDetailLevel().getLevel() >= MetadataGenerator.DETAIL_LEVEL.TRIPLE.getLevel()) {
             pogFunction = (subject, pog) -> {
-                generateQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph());
                 metadataGenerator.insertQuad(new ProvenancedQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph()));
+                return generateQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph());
             };
         } else {
             pogFunction = (subject, pog) -> generateQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph());
         }
 
-        return executeWithFunction(triplesMaps, removeDuplicates, pogFunction);
+        if (triplesMaps == null || triplesMaps.isEmpty()) triplesMaps = this.initializer.getTriplesMaps();
+
+        List<Quad> quads = executeWithFunction(triplesMaps, this.mappings, pogFunction, this.baseIRI);
+        quads.forEach(quad -> resultingQuads.addQuad(quad));
+        if (removeDuplicates) this.resultingQuads.removeDuplicates();
+        return resultingQuads;
     }
 
-    ProvenancedTerm validateNamedNodeSubject(ProvenancedTerm subject, String subjectIri, String baseIRI){
+    private Quad generateQuad(ProvenancedTerm subject, ProvenancedTerm predicate, ProvenancedTerm object, ProvenancedTerm graph) {
+        Term g = graph != null? graph.getTerm() : null;
+        if (subject != null && predicate != null & object != null) {
+            return new Quad(subject.getTerm(), predicate.getTerm(), object.getTerm(), g);
+        }
+        return null;
+    }
+
+    public List<Quad> executeWithFunction(List<Term> triplesMaps, Map<Term, Mapping> mappings,
+                                          BiFunction<ProvenancedTerm, PredicateObjectGraph, Quad> pogFunction, String baseIRI) throws Exception {
+        List<Quad> quads = new ArrayList<>();
+
+        //we execute every mapping
+        for (Term triplesMap : triplesMaps) {
+            Mapping mapping = mappings.get(triplesMap);
+
+            //for each Record, apply the mapping
+            for (Record record : this.getRecords(triplesMap)) {
+                migrateRecord(record, triplesMap, mapping ,pogFunction, baseIRI)
+                        .forEach(quads::add);
+            }
+        }
+        return quads;
+    }
+
+    Stream<Quad> migrateRecord(Record record, Term triplesMap, Mapping mapping,
+                                BiFunction<ProvenancedTerm, PredicateObjectGraph, Quad> pogFunction, String baseIRI) throws Exception {
+        List<Term> nodes = mapping.getSubjectMappingInfo().getTermGenerator().generate(record);
+        ProvenancedTerm subject = !nodes.isEmpty() ?
+                new ProvenancedTerm(nodes.get(0), new Metadata(triplesMap, mapping.getSubjectMappingInfo().getTerm())) :
+                null;
+
+        // If we have subject and it's a named node,
+        // we validate it and make it an absolute IRI if needed.
+        if (subject != null && subject.getTerm() instanceof NamedNode) {
+            String iri = subject.getTerm().getValue();
+            subject = validateNamedNodeSubject(subject, iri, baseIRI);
+        }
+
+        final ProvenancedTerm finalSubject = subject;
+        //TODO validate subject or check if blank node
+        if (subject != null) {
+            List<ProvenancedTerm> subjectGraphs = new ArrayList<>();
+
+            mapping.getGraphMappingInfos().forEach(mappingInfo -> {
+                try {
+                    List<Term> terms = mappingInfo.getTermGenerator().generate(record);
+                    terms.stream()
+                            .filter(term -> !term.equals(new NamedNode(NAMESPACES.RR + "defaultGraph")))
+                            .forEach(term -> subjectGraphs.add(new ProvenancedTerm(term)));
+                } catch (Exception e) {
+                    //todo be more nice and gentle
+                    e.printStackTrace();
+                }
+            });
+            return this.generatePredicateObjectGraphs(mapping, record, subjectGraphs).stream()
+                    .map(pog -> pogFunction.apply(finalSubject, pog))
+                    .filter(Objects::nonNull);
+        }
+        return Stream.empty();
+    }
+
+    private ProvenancedTerm validateNamedNodeSubject(ProvenancedTerm subject, String subjectIri, String baseIRI){
         ProvenancedTerm validatedTerm = subject;
         // Is the IRI valid?
         if (!Utils.isValidIRI(subjectIri)) {
@@ -107,63 +179,12 @@ public class Executor {
         return validatedTerm;
     }
 
-    public QuadStore executeWithFunction(List<Term> triplesMaps, boolean removeDuplicates, BiConsumer<ProvenancedTerm, PredicateObjectGraph> pogFunction) throws Exception {
-        //check if TriplesMaps are provided
-        if (triplesMaps == null || triplesMaps.isEmpty()) {
-            triplesMaps = this.initializer.getTriplesMaps();
-        }
-
-        //we execute every mapping
-        for (Term triplesMap : triplesMaps) {
-            Mapping mapping = this.mappings.get(triplesMap);
-
-            List<Record> records = this.getRecords(triplesMap);
-
-            //TODO this is the main migration loop
-            //for each Record, apply the mapping
-            for (int j = 0; j < records.size(); j++) {
-                Record record = records.get(j);
-                ProvenancedTerm subject = getSubject(triplesMap, mapping, record, j);
-
-                // If we have subject and it's a named node,
-                // we validate it and make it an absolute IRI if needed.
-                if (subject != null && subject.getTerm() instanceof NamedNode) {
-                    String iri = subject.getTerm().getValue();
-                    subject = validateNamedNodeSubject(subject, iri, this.baseIRI);
-                }
-
-                final ProvenancedTerm finalSubject = subject;
-                //TODO validate subject or check if blank node
-                if (subject != null) {
-                    List<ProvenancedTerm> subjectGraphs = new ArrayList<>();
-
-                    mapping.getGraphMappingInfos().forEach(mappingInfo -> {
-                        try {
-                            List<Term> terms = mappingInfo.getTermGenerator().generate(record);
-                            terms.stream()
-                                    .filter(term -> !term.equals(new NamedNode(NAMESPACES.RR + "defaultGraph")))
-                                    .forEach(term -> subjectGraphs.add(new ProvenancedTerm(term)));
-                        } catch (Exception e) {
-                            //todo be more nice and gentle
-                            e.printStackTrace();
-                        }
-                    });
-                    List<PredicateObjectGraph> pogs = this.generatePredicateObjectGraphs(mapping, record, subjectGraphs);
-                    pogs.forEach(pog -> pogFunction.accept(finalSubject, pog));
-                }
-            }
-        }
-        if (removeDuplicates) this.resultingQuads.removeDuplicates();
-        return resultingQuads;
-    }
-
     public QuadStore execute(List<Term> triplesMaps) throws Exception {
         return this.execute(triplesMaps, false, null);
     }
 
     private List<PredicateObjectGraph> generatePredicateObjectGraphs(Mapping mapping, Record record, List<ProvenancedTerm> alreadyNeededGraphs) throws Exception {
         ArrayList<PredicateObjectGraph> results = new ArrayList<>();
-
         List<PredicateObjectGraphMapping> predicateObjectGraphMappings = mapping.getPredicateObjectGraphMappings();
 
         for (PredicateObjectGraphMapping pogMapping : predicateObjectGraphMappings) {
@@ -172,11 +193,9 @@ public class Executor {
             poGraphs.addAll(alreadyNeededGraphs);
 
             if (pogMapping.getGraphMappingInfo() != null && pogMapping.getGraphMappingInfo().getTermGenerator() != null) {
-                pogMapping.getGraphMappingInfo().getTermGenerator().generate(record).forEach(term -> {
-                    if (!term.equals(new NamedNode(NAMESPACES.RR + "defaultGraph"))) {
-                        poGraphs.add(new ProvenancedTerm(term));
-                    }
-                });
+                pogMapping.getGraphMappingInfo().getTermGenerator().generate(record).stream()
+                        .filter(term -> !term.equals(new NamedNode(NAMESPACES.RR + "defaultGraph")))
+                        .forEach(term -> poGraphs.add(new ProvenancedTerm(term)));
             }
 
             pogMapping.getPredicateMappingInfo().getTermGenerator().generate(record).forEach(p -> {
@@ -203,23 +222,14 @@ public class Executor {
                 //check if need to apply a join condition
                 if (!pogMapping.getJoinConditions().isEmpty()) {
                     objects = this.getIRIsWithConditions(record, pogMapping.getParentTriplesMap(), pogMapping.getJoinConditions());
-                    //this.generateTriples(subject, po.getPredicateGenerator(), objects, record, combinedGraphs);
                 } else {
                     objects = this.getAllIRIs(pogMapping.getParentTriplesMap());
                 }
-
                 results.addAll(combineMultiplePOGs(predicates, objects, poGraphs));
             }
         }
 
         return results;
-    }
-
-    private void generateQuad(ProvenancedTerm subject, ProvenancedTerm predicate, ProvenancedTerm object, ProvenancedTerm graph) {
-        Term g = graph != null? graph.getTerm() : null;
-        if (subject != null && predicate != null & object != null) {
-            this.resultingQuads.addQuad(subject.getTerm(), predicate.getTerm(), object.getTerm(), g);
-        }
     }
 
     private List<ProvenancedTerm> getIRIsWithConditions(Record record, Term triplesMap, List<MultipleRecordsFunctionExecutor> conditions) throws Exception {
@@ -305,10 +315,8 @@ public class Executor {
         for (int i = 0; i < records.size(); i++) {
             Record record = records.get(i);
             ProvenancedTerm subject = getSubject(triplesMap, mapping, record, i);
-
             iris.add(subject);
         }
-
         return iris;
     }
 
@@ -316,7 +324,6 @@ public class Executor {
         if (!this.recordsHolders.containsKey(triplesMap)) {
             this.recordsHolders.put(triplesMap, this.recordsFactory.createRecords(triplesMap, this.rmlStore));
         }
-
         return this.recordsHolders.get(triplesMap);
     }
 

@@ -74,3 +74,4 @@ public class Quad implements Comparable<Quad> {
         }
     }
 }
+
