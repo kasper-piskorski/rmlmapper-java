@@ -2,7 +2,6 @@ package be.ugent.rml.cli;
 
 import be.ugent.rml.Executor;
 import be.ugent.rml.Utils;
-import be.ugent.rml.access.DatabaseType;
 import be.ugent.rml.conformer.MappingConformer;
 import be.ugent.rml.functions.FunctionLoader;
 import be.ugent.rml.functions.lib.IDLabFunctions;
@@ -14,16 +13,35 @@ import be.ugent.rml.store.SimpleQuadStore;
 import be.ugent.rml.term.NamedNode;
 import be.ugent.rml.term.Term;
 import ch.qos.logback.classic.Level;
-import org.apache.commons.cli.*;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
 import org.eclipse.rdf4j.rio.RDFFormat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.Marker;
 import org.slf4j.MarkerFactory;
 
-import java.io.*;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStreamWriter;
+import java.io.SequenceInputStream;
+import java.io.Writer;
 import java.time.Instant;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 import java.util.stream.Collectors;
 
 public class Main {
@@ -194,6 +212,7 @@ public class Main {
                 Executor executor;
 
                 // Extract required information and create the MetadataGenerator
+                // NB: loading metadata
                 MetadataGenerator metadataGenerator = null;
                 String metadataFile = getPriorityOptionValue(metadataOption, lineArgs, configFile);
                 String requestedDetailLevel = getPriorityOptionValue(metadataDetailLevelOption, lineArgs, configFile);
@@ -253,6 +272,7 @@ public class Main {
 
                 // We have to get the. InputStreams of the RML documents again,
                 //                // because we can only use an InputStream once
+                // NB : moption -> mappings
                 lis = Arrays.stream(mOptionValue)
                         .map(Utils::getInputStreamFromFileOrContentString)
                         .collect(Collectors.toList());

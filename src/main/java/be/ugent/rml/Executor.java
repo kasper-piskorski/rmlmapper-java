@@ -29,7 +29,11 @@ public class Executor {
     // this map stores for every Triples Map, which is a Term, a map with the record index and the record's corresponding subject,
     // which is a ProvenancedTerm.
     private HashMap<Term, HashMap<Integer, ProvenancedTerm>> subjectCache;
+
+    //NB: mapped quads store
     private QuadStore resultingQuads;
+
+    //NB: mapping store
     private QuadStore rmlStore;
     private RecordsFactory recordsFactory;
     private static int blankNodeCounter = 0;
@@ -70,12 +74,37 @@ public class Executor {
                 metadataGenerator.insertQuad(new ProvenancedQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph()));
             };
         } else {
-            pogFunction = (subject, pog) -> {
-                generateQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph());
-            };
+            pogFunction = (subject, pog) -> generateQuad(subject, pog.getPredicate(), pog.getObject(), pog.getGraph());
         }
 
         return executeWithFunction(triplesMaps, removeDuplicates, pogFunction);
+    }
+
+    ProvenancedTerm validateNamedNodeSubject(ProvenancedTerm subject, String subjectIri, String baseIRI){
+        ProvenancedTerm validatedTerm = subject;
+        // Is the IRI valid?
+        if (!Utils.isValidIRI(subjectIri)) {
+            logger.error("The subject \"" + subjectIri + "\" is not a valid IRI. Skipped.");
+            validatedTerm = null;
+            // Is the IRI relative?
+        } else if (Utils.isRelativeIRI(subjectIri)) {
+            // Check the base IRI to see if we can use it to turn the IRI into an absolute one.
+            if (baseIRI == null) {
+                logger.error("The base IRI is null, so relative IRI of subject cannot be turned in to absolute IRI. Skipped.");
+                validatedTerm = null;
+            } else {
+                logger.debug("The IRI of subject is made absolute via base IRI.");
+                String iri = baseIRI + subjectIri;
+
+                // Check if the new absolute IRI is valid.
+                if (Utils.isValidIRI(iri)) {
+                    validatedTerm = new ProvenancedTerm(new NamedNode(iri), subject.getMetadata());
+                } else {
+                    logger.error("The subject \"" + iri + "\" is not a valid IRI. Skipped.");
+                }
+            }
+        }
+        return validatedTerm;
     }
 
     public QuadStore executeWithFunction(List<Term> triplesMaps, boolean removeDuplicates, BiConsumer<ProvenancedTerm, PredicateObjectGraph> pogFunction) throws Exception {
@@ -90,6 +119,8 @@ public class Executor {
 
             List<Record> records = this.getRecords(triplesMap);
 
+            //TODO this is the main migration loop
+            //for each Record, apply the mapping
             for (int j = 0; j < records.size(); j++) {
                 Record record = records.get(j);
                 ProvenancedTerm subject = getSubject(triplesMap, mapping, record, j);
@@ -98,74 +129,37 @@ public class Executor {
                 // we validate it and make it an absolute IRI if needed.
                 if (subject != null && subject.getTerm() instanceof NamedNode) {
                     String iri = subject.getTerm().getValue();
-
-                    // Is the IRI valid?
-                    if (!Utils.isValidIRI(iri)) {
-                        logger.error("The subject \"" + iri + "\" is not a valid IRI. Skipped.");
-                        subject = null;
-
-                    // Is the IRI relative?
-                    } else if (Utils.isRelativeIRI(iri)) {
-
-                        // Check the base IRI to see if we can use it to turn the IRI into an absolute one.
-                        if (this.baseIRI == null) {
-                            logger.error("The base IRI is null, so relative IRI of subject cannot be turned in to absolute IRI. Skipped.");
-                            subject = null;
-                        } else {
-                            logger.debug("The IRI of subject is made absolute via base IRI.");
-                            iri = this.baseIRI + iri;
-
-                            // Check if the new absolute IRI is valid.
-                            if (Utils.isValidIRI(iri)) {
-                                subject = new ProvenancedTerm(new NamedNode(iri), subject.getMetadata());
-                            } else {
-                                logger.error("The subject \"" + iri + "\" is not a valid IRI. Skipped.");
-                            }
-                        }
-                    }
+                    subject = validateNamedNodeSubject(subject, iri, this.baseIRI);
                 }
 
                 final ProvenancedTerm finalSubject = subject;
-
                 //TODO validate subject or check if blank node
                 if (subject != null) {
                     List<ProvenancedTerm> subjectGraphs = new ArrayList<>();
 
                     mapping.getGraphMappingInfos().forEach(mappingInfo -> {
-                        List<Term> terms = null;
-
                         try {
-                            terms = mappingInfo.getTermGenerator().generate(record);
+                            List<Term> terms = mappingInfo.getTermGenerator().generate(record);
+                            terms.stream()
+                                    .filter(term -> !term.equals(new NamedNode(NAMESPACES.RR + "defaultGraph")))
+                                    .forEach(term -> subjectGraphs.add(new ProvenancedTerm(term)));
                         } catch (Exception e) {
                             //todo be more nice and gentle
                             e.printStackTrace();
                         }
-
-                        terms.forEach(term -> {
-                            if (!term.equals(new NamedNode(NAMESPACES.RR + "defaultGraph"))) {
-                                subjectGraphs.add(new ProvenancedTerm(term));
-                            }
-                        });
                     });
-
                     List<PredicateObjectGraph> pogs = this.generatePredicateObjectGraphs(mapping, record, subjectGraphs);
-
                     pogs.forEach(pog -> pogFunction.accept(finalSubject, pog));
                 }
             }
         }
-
-        if (removeDuplicates) {
-            this.resultingQuads.removeDuplicates();
-        }
-
+        if (removeDuplicates) this.resultingQuads.removeDuplicates();
         return resultingQuads;
     }
 
     public QuadStore execute(List<Term> triplesMaps) throws Exception {
         return this.execute(triplesMaps, false, null);
     }
-
 
     private List<PredicateObjectGraph> generatePredicateObjectGraphs(Mapping mapping, Record record, List<ProvenancedTerm> alreadyNeededGraphs) throws Exception {
         ArrayList<PredicateObjectGraph> results = new ArrayList<>();
@@ -222,13 +216,7 @@ public class Executor {
     }
 
     private void generateQuad(ProvenancedTerm subject, ProvenancedTerm predicate, ProvenancedTerm object, ProvenancedTerm graph) {
-        Term g = null;
-
-        if (graph != null) {
-            g = graph.getTerm();
-        }
-
-
+        Term g = graph != null? graph.getTerm() : null;
         if (subject != null && predicate != null & object != null) {
             this.resultingQuads.addQuad(subject.getTerm(), predicate.getTerm(), object.getTerm(), g);
         }
@@ -300,7 +288,8 @@ public class Executor {
 
             if (!nodes.isEmpty()) {
                 //todo: only create metadata when it's required
-                this.subjectCache.get(triplesMap).put(i, new ProvenancedTerm(nodes.get(0), new Metadata(triplesMap, mapping.getSubjectMappingInfo().getTerm())));
+                ProvenancedTerm provenancedTerm = new ProvenancedTerm(nodes.get(0), new Metadata(triplesMap, mapping.getSubjectMappingInfo().getTerm()));
+                this.subjectCache.get(triplesMap).put(i, provenancedTerm);
             }
         }
 

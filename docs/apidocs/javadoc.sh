@@ -1,1 +1,1 @@
-/home/pheyvaer/.sdkman/candidates/java/current/bin/javadoc @options @packages
+/usr/local/Cellar/jenv/versions/openjdk64-11.0.2/bin/javadoc @options @packages

@@ -58,8 +58,7 @@ public abstract class TestCore {
 
         rmlStore.addQuads(extraQuads);
 
-        return new Executor(rmlStore,
-                new RecordsFactory(parentPath), Utils.getBaseDirectiveTurtle(mappingFile));
+        return new Executor(rmlStore, new RecordsFactory(parentPath), Utils.getBaseDirectiveTurtle(mappingFile));
     }
 
     Executor createExecutor(String mapPath, String parentPath) throws Exception {
